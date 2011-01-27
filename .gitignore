@@ -1,0 +1,6 @@
+*.dump
+_build
+*.beam
+*~
+*.swp
+*.swo
