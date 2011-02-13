@@ -71,63 +71,110 @@ loop(Parent, Name, Marking, PN, StateData, Mod, hibernate) ->
     proc_lib:hibernate(?MODULE,wake_hib,
 		[Parent, Name, Marking, PN, StateData, Mod, true]);
 loop(Parent, Name, Marking, PN, StateData, Mod, Time) ->
+	Ctx = [{name, Name},
+		{parent, Parent},
+		{original_marking, Marking},
+		{petri_net, PN},
+		{state_data, StateData},
+		{module, Mod},
+		{time, Time}],
     Msg = receive
 		{'EXIT', Parent, Reason} ->
-		    terminate(Reason, Name, Msg, Mod, OriginalMarking, PetriNet, StateData);
+			ExitCtx = [{message, {'EXIT', Parent, Reason}}] ++ Ctx,
+		    terminate(Reason, ExitCtx);
 	    Input ->
 		    Input
 	  after Time ->
 		  {'$gen_event', timeout}
 	  end,
-    handle_msg(Msg,Parent, Name, Marking, PN, StateData, Mod, Time).
+	Ctx2 = [{message, Msg}] ++ Ctx,
+    handle_msg(Ctx2).
 
 %% dispatches incoming events to the user Mod
-handle_msg(Msg, Parent, Name, OriginalMarking, PetriNet, StateData, Mod, Time)->
-	Response = case Msg of
+handle_msg(Ctx)->
+	Msg = proplists:lookup(message, Ctx),
+	{Outcome, NewCtx} = case Msg of
 		{signal, Place, Args} ->
-			process_signal(PetriNet, Place, OriginalMarking, Mod, StateData);
+			Ctx2 = [{place, Place}, {args, Args}] ++ Ctx,
+			process_signal(Ctx2);
 		{signal, Place, Args, From} ->
-			process_signal(PetriNet, Place, OriginalMarking, Mod, StateData);
-		Other ->
-			terminate(unknown_input, Name, Msg, Mod, OriginalMarking, PetriNet, StateData)
+			Ctx2 = [{place, Place}, {args, Args}, {from, From}] ++ Ctx,
+			process_signal(Ctx2);
+		_Other ->
+			terminate(unknown_input, Ctx)
 		end,
-	process_reponse(Other, Parent, Name, PetriNet, OriginalMarking, StateData, Mod, Time).		
+	process_response(Outcome, NewCtx).		
 
-process_signal(PetriNet, Place, OriginalMarking, Mod, StateData)->
+process_signal(Ctx)->
+	Place = proplists:lookup(place, Ctx),
+	OriginalMarking  = proplists:lookup(original_marking, Ctx),
 	SignalledMarking = petrinet:signal(Place, OriginalMarking),
-	FireList = petrinet:get_fire_list(PetriNet, SignalledMarking),
+	FireList = petrinet:get_fire_list(proplists:lookup(petri_net, Ctx), SignalledMarking),
 	case FireList of
 		[non_live] ->
-			no_op;
+			{no_op, Ctx};
 		[{T, ResultMarking}]->
-			case Mod:T(StateData, PetriNet, OriginalMarking, ResultMarking, Args) of 
+			Ctx2 = [{signalled_marking, SignalledMarking}, {fired_transition, T}, {result_marking, ResultMarking}] ++ Ctx,
+			{result, Reply, Ctx3} = invoke_transition(Ctx2),
+			case Reply of 
 				{stop, Reason} ->
-					terminate(Reason, Name, [], Mod, OriginalMarking, PetriNet, StateData);
-				Other ->
-					{Other, ResultMarking}
+					terminate(Reason, Ctx3);
+				{ok, Response, NewStateData} ->
+					{fired, [{new_state_data, NewStateData},{response, Response}]++Ctx3}
 			end
 	end.
 
-process_response(Response, Parent, Name, PetriNet, OriginalMarking, StateData, Mod, Time)
-	case Response of
+invoke_transition(Ctx)->
+	Mod = proplists:lookup(module, Ctx),
+	T = proplists:lookup(fired_transition, Ctx),
+	StateData = proplists:lookup(state_data, Ctx),
+	PetriNet = proplists:lookup(petri_net, Ctx),
+	OriginalMarking = proplists:lookup(original_marking, Ctx),
+	ResultMarking = proplists:lookup(result_marking, Ctx),
+	Args = proplists:lookup(args, Ctx),
+	Reply = Mod:T(StateData, PetriNet, OriginalMarking, ResultMarking, Args),
+	{result, Reply, [{reply, Reply}]++Ctx}.
+
+process_response(Outcome, Ctx)->
+	case Outcome of
 		no_op ->
-			loop(Parent, Name, OriginalMarking, PetriNet, StateData, Mod, Time);
-		{{reply, ReplyMsg, NewStateData}, NewMarking}->
+			do_loop(Ctx);
+		fired->
 			% do the reply here...
-			do_reply(From, ReplyMsg),
-			loop(Parent, Name, NewMarking, PetriNet, NewStateData, Mod, Time);
+			do_reply(Ctx),
+			do_loop(Ctx)
 	end.
 
-do_reply(From, ReplyMsg)->
-	From ! ReplyMsg.
+do_loop(Ctx)->
+	Parent = proplists:lookup(parent, Ctx),
+	Name = proplists:lookup(name, Ctx),
+	Mod = proplists:lookup(module, Ctx),
+	Time = proplists:lookup(time, Ctx),
+	NewStateData = proplists:lookup(new_state_data, Ctx),
+	PetriNet = proplists:lookup(petri_net, Ctx),
+	NewStateData = proplists:lookup(new_state_data, Ctx),
+	ResultMarking = proplists:lookup(result_marking, Ctx),
+	loop(Parent, Name, ResultMarking, PetriNet, NewStateData, Mod, Time).
+
+
+do_reply(Ctx)->
+	From = proplists:lookup(from, Ctx),
+	Response = proplists:lookup(response, Ctx),
+	From ! Response.
 
 %%---------------------------------------------
 %% stuff lifted straight out of gen_fsm
 %%---------------------------------------------
-terminate(Reason, Name, Msg, Mod, Marking, PetriNet, StateData) ->
-    case catch Mod:terminate(Reason, Marking, PetriNet, StateData) of
+terminate(Reason, Ctx) ->
+	Msg = proplists:lookup(message, Ctx),
+	Name = proplists:lookup(name, Ctx),
+	Mod = proplists:lookup(module, Ctx),
+	OriginalMarking = proplists:lookup(original_marking, Ctx),
+	PetriNet = proplists:lookup(petri_net, Ctx),
+	StateData = proplists:lookup(state_data, Ctx),
+    case catch Mod:terminate(Reason, OriginalMarking, PetriNet, StateData) of
 	{'EXIT', R} ->
-	    error_info(R, Name, Msg, Marking, PetriNet, StateData),
+	    error_info(R, Name, Msg, OriginalMarking, StateData),
 	    exit(R);
 	_ ->
 	    case Reason of
@@ -149,12 +196,12 @@ terminate(Reason, Name, Msg, Mod, Marking, PetriNet, StateData) ->
 					_ ->
 						StateData
                         end,
-		    error_info(Reason,Name,Msg,Marking, PetriNet,FmtStateData),
+		    error_info(Reason,Name,Msg,OriginalMarking, FmtStateData),
 		    exit(Reason)
 	    end
     end.
 
-error_info(Reason, Name, Msg, Marking, PetriNet, StateData) ->
+error_info(Reason, Name, Msg, Marking, StateData) ->
     Reason1 = case Reason of
 	    {undef,[{M,F,A}|MFAs]} ->
 			case code:is_loaded(M) of
@@ -193,11 +240,3 @@ get_msg_str({timeout, _Ref, {'$gen_event', _Msg}}) ->
     "** Last timer event in was ~p~n";
 get_msg_str(_Msg) ->
     "** Last message in was ~p~n".
-
-get_msg({'$gen_event', Event}) -> Event;
-get_msg({'$gen_sync_event', Event}) -> Event;
-get_msg({'$gen_all_state_event', Event}) -> Event;
-get_msg({'$gen_sync_all_state_event', Event}) -> Event;
-get_msg({timeout, Ref, {'$gen_timer', Msg}}) -> {timeout, Ref, Msg};
-get_msg({timeout, _Ref, {'$gen_event', Event}}) -> Event;
-get_msg(Msg) -> Msg.
